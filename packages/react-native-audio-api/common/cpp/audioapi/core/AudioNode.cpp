@@ -29,6 +29,10 @@ AudioNode::~AudioNode() {
   }
 }
 
+bool AudioNode::canBeDestructed() const {
+  return true;
+}
+
 size_t AudioNode::getChannelCount() const {
   return channelCount_;
 }
