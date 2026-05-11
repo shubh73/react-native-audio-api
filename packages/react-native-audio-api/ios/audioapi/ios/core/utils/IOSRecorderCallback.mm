@@ -11,6 +11,8 @@
 #include <audioapi/utils/CircularArray.hpp>
 #include <audioapi/utils/Result.hpp>
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <utility>
 
 namespace audioapi {
@@ -32,17 +34,7 @@ IOSRecorderCallback::IOSRecorderCallback(
 
 IOSRecorderCallback::~IOSRecorderCallback()
 {
-  @autoreleasepool {
-    converter_ = nil;
-    bufferFormat_ = nil;
-    callbackFormat_ = nil;
-    converterInputBuffer_ = nil;
-    converterOutputBuffer_ = nil;
-
-    for (size_t i = 0; i < channelCount_; ++i) {
-      circularBuffer_[i]->zero();
-    }
-  }
+  cleanup();
 }
 
 /// @brief Prepares the IOSRecorderCallback for receiving audio data.
@@ -104,6 +96,7 @@ Result<NoneType, std::string> IOSRecorderCallback::prepare(
 /// This method should be called from the JS thread only.
 void IOSRecorderCallback::cleanup()
 {
+  std::scoped_lock lock(callbackMutex_);
   @autoreleasepool {
     if (circularBuffer_[0]->getNumberOfAvailableFrames() > 0) {
       emitAudioData(true);
@@ -115,7 +108,7 @@ void IOSRecorderCallback::cleanup()
     converterInputBuffer_ = nil;
     converterOutputBuffer_ = nil;
 
-    for (size_t i = 0; i < channelCount_; ++i) {
+    for (int i = 0; i < channelCount_; ++i) {
       circularBuffer_[i]->zero();
     }
     offloader_.reset();
@@ -132,15 +125,56 @@ void IOSRecorderCallback::receiveAudioData(const AudioBufferList *inputBuffer, i
   if (!isInitialized_.load(std::memory_order_acquire)) {
     return;
   }
-  offloader_->getSender()->send({inputBuffer, numFrames});
+
+  // CoreAudio owns `inputBuffer` only for the duration of this synchronous
+  // callback. Copy into an owned AudioBufferList before handing off to the
+  // worker thread; the consumer in taskOffloaderFunction frees it.
+  UInt32 bufferCount = inputBuffer->mNumberBuffers;
+  size_t headerSize = offsetof(AudioBufferList, mBuffers) + sizeof(AudioBuffer) * bufferCount;
+  AudioBufferList *owned = static_cast<AudioBufferList *>(std::malloc(headerSize));
+  if (owned == nullptr) {
+    return;
+  }
+  owned->mNumberBuffers = bufferCount;
+  for (UInt32 i = 0; i < bufferCount; ++i) {
+    UInt32 byteSize = inputBuffer->mBuffers[i].mDataByteSize;
+    owned->mBuffers[i].mNumberChannels = inputBuffer->mBuffers[i].mNumberChannels;
+    owned->mBuffers[i].mDataByteSize = byteSize;
+    void *channelData = std::malloc(byteSize);
+    if (channelData == nullptr) {
+      for (UInt32 j = 0; j < i; ++j) {
+        std::free(owned->mBuffers[j].mData);
+      }
+      std::free(owned);
+      return;
+    }
+    std::memcpy(channelData, inputBuffer->mBuffers[i].mData, byteSize);
+    owned->mBuffers[i].mData = channelData;
+  }
+
+  offloader_->getSender()->send({owned, numFrames});
+}
+
+static inline void freeOwnedAudioBufferList(const AudioBufferList *bufferList)
+{
+  if (bufferList == nullptr) {
+    return;
+  }
+  for (UInt32 i = 0; i < bufferList->mNumberBuffers; ++i) {
+    std::free(bufferList->mBuffers[i].mData);
+  }
+  std::free(const_cast<AudioBufferList *>(bufferList));
 }
 
 void IOSRecorderCallback::taskOffloaderFunction(CallbackData data)
 {
   auto [inputBuffer, numFrames] = data;
-  // dummy data to wake up thread after cleanup, skip processing it
+
+  // The TaskOffloader destructor sends a default-constructed CallbackData
+  // (data == nullptr) to unblock the receiver; ignore it here.
   if (inputBuffer == nullptr)
     return;
+  std::scoped_lock lock(callbackMutex_);
   @autoreleasepool {
     NSError *error = nil;
 
@@ -152,6 +186,7 @@ void IOSRecorderCallback::taskOffloaderFunction(CallbackData data)
         circularBuffer_[i]->push_back(data, numFrames);
       }
 
+      freeOwnedAudioBufferList(inputBuffer);
       inputBuffer = nullptr;
       if (circularBuffer_[0]->getNumberOfAvailableFrames() >= bufferLength_) {
         emitAudioData();
@@ -168,6 +203,7 @@ void IOSRecorderCallback::taskOffloaderFunction(CallbackData data)
           inputBuffer->mBuffers[i].mDataByteSize);
     }
 
+    freeOwnedAudioBufferList(inputBuffer);
     inputBuffer = nullptr;
     converterInputBuffer_.frameLength = numFrames;
 

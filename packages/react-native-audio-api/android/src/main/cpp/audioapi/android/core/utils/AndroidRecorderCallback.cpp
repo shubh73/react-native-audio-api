@@ -7,6 +7,7 @@
 #include <audioapi/utils/CircularArray.hpp>
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -35,20 +36,7 @@ AndroidRecorderCallback::AndroidRecorderCallback(
           callbackId) {}
 
 AndroidRecorderCallback::~AndroidRecorderCallback() {
-  if (converter_ != nullptr) {
-    ma_data_converter_uninit(converter_.get(), nullptr);
-    converter_.reset();
-  }
-
-  if (processingBuffer_ != nullptr) {
-    ma_free(processingBuffer_, nullptr);
-    processingBuffer_ = nullptr;
-    processingBufferLength_ = 0;
-  }
-
-  for (size_t i = 0; i < circularBuffer_.size(); ++i) {
-    circularBuffer_[i]->zero();
-  }
+  cleanup();
 }
 
 /// @brief Prepares the recorder callback by initializing the data converter and allocating necessary buffers.
@@ -111,6 +99,7 @@ Result<NoneType, std::string> AndroidRecorderCallback::prepare(
 }
 
 void AndroidRecorderCallback::cleanup() {
+  std::scoped_lock lock(callbackMutex_);
   if (circularBuffer_[0]->getNumberOfAvailableFrames() > 0) {
     emitAudioData(true);
   }
@@ -141,7 +130,18 @@ void AndroidRecorderCallback::receiveAudioData(void *data, int numFrames) {
     return;
   }
 
-  offloader_->getSender()->send({data, numFrames});
+  // Oboe owns `data` only for the duration of this synchronous callback.
+  // Copy into an owned buffer before handing off to the worker thread; the
+  // consumer in taskOffloaderFunction frees it.
+  size_t bytes =
+      static_cast<size_t>(numFrames) * streamChannelCount_ * ma_get_bytes_per_sample(ma_format_f32);
+  void *owned = ma_malloc(bytes, nullptr);
+  if (owned == nullptr) {
+    return;
+  }
+  std::memcpy(owned, data, bytes);
+
+  offloader_->getSender()->send({owned, numFrames});
 }
 
 /// @brief Deinterleaves the audio data and pushes it into the circular buffer.
@@ -160,6 +160,14 @@ void AndroidRecorderCallback::deinterleaveAndPushAudioData(void *data, int numFr
 /// processes it (resampling and deinterleaving if necessary), and pushes it into the circular buffer.
 void AndroidRecorderCallback::taskOffloaderFunction(CallbackData callbackData) {
   auto [data, numFrames] = callbackData;
+
+  // The TaskOffloader destructor sends a default-constructed CallbackData
+  // (data == nullptr) to unblock the receiver; ignore it here.
+  if (data == nullptr) {
+    return;
+  }
+  std::scoped_lock lock(callbackMutex_);
+
   ma_uint64 inputFrameCount = numFrames;
   ma_uint64 outputFrameCount = 0;
 
@@ -170,6 +178,7 @@ void AndroidRecorderCallback::taskOffloaderFunction(CallbackData callbackData) {
     if (circularBuffer_[0]->getNumberOfAvailableFrames() >= bufferLength_) {
       emitAudioData();
     }
+    ma_free(data, nullptr);
     return;
   }
 
@@ -184,6 +193,8 @@ void AndroidRecorderCallback::taskOffloaderFunction(CallbackData callbackData) {
   if (circularBuffer_[0]->getNumberOfAvailableFrames() >= bufferLength_) {
     emitAudioData();
   }
+
+  ma_free(data, nullptr);
 }
 
 } // namespace audioapi
